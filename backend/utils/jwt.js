@@ -1,25 +1,27 @@
-const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
-const RefreshToken = require('../models/RefreshToken');
+const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
+const RefreshToken = require("../models/RefreshToken");
 
 /**
  * Generate a short-lived access token (15min)
  */
 const generateAccessToken = (userId, role) => {
-  return jwt.sign(
-    { userId, role },
-    process.env.JWT_ACCESS_SECRET,
-    { expiresIn: process.env.JWT_ACCESS_EXPIRES_IN || '15m' }
-  );
+  return jwt.sign({ userId, role }, process.env.JWT_ACCESS_SECRET, {
+    expiresIn: process.env.JWT_ACCESS_EXPIRES_IN || "15m",
+  });
 };
 
 /**
  * Generate a secure random refresh token string,
  * persist it to MongoDB, return the raw token string
  */
-const generateRefreshToken = async (userId, userAgent = null, ipAddress = null) => {
+const generateRefreshToken = async (
+  userId,
+  userAgent = null,
+  ipAddress = null,
+) => {
   // Secure random token — not JWT, just a long random string
-  const token = crypto.randomBytes(64).toString('hex');
+  const token = crypto.randomBytes(64).toString("hex");
 
   const expiresAt = new Date();
   expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
@@ -47,16 +49,16 @@ const verifyAccessToken = (token) => {
  * Returns the token document if valid, throws if not
  */
 const validateRefreshToken = async (token) => {
-  const tokenDoc = await RefreshToken.findOne({ token }).populate('userId');
+  const tokenDoc = await RefreshToken.findOne({ token }).populate("userId");
 
   if (!tokenDoc) {
-    throw new Error('Refresh token not found');
+    throw new Error("Refresh token not found");
   }
   if (tokenDoc.isRevoked) {
-    throw new Error('Refresh token has been revoked');
+    throw new Error("Refresh token has been revoked");
   }
   if (tokenDoc.expiresAt < new Date()) {
-    throw new Error('Refresh token has expired');
+    throw new Error("Refresh token has expired");
   }
 
   return tokenDoc;
@@ -66,10 +68,7 @@ const validateRefreshToken = async (token) => {
  * Revoke a single refresh token (logout current device)
  */
 const revokeRefreshToken = async (token) => {
-  await RefreshToken.findOneAndUpdate(
-    { token },
-    { isRevoked: true }
-  );
+  await RefreshToken.findOneAndUpdate({ token }, { isRevoked: true });
 };
 
 /**
@@ -78,7 +77,7 @@ const revokeRefreshToken = async (token) => {
 const revokeAllUserRefreshTokens = async (userId) => {
   await RefreshToken.updateMany(
     { userId, isRevoked: false },
-    { isRevoked: true }
+    { isRevoked: true },
   );
 };
 
@@ -86,14 +85,12 @@ const revokeAllUserRefreshTokens = async (userId) => {
  * Set refresh token as HttpOnly cookie
  */
 const setRefreshTokenCookie = (res, token) => {
-  res.cookie('refreshToken', token, {
-    httpOnly: true,                                      // not accessible via JS
-    secure: process.env.NODE_ENV === 'production',       // HTTPS only in prod
-    sameSite: process.env.NODE_ENV === 'production'
-      ? 'strict'
-      : 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000,                   // 7 days in ms
-    path: '/api/auth',                                   // only sent to auth routes
+  res.cookie("refreshToken", token, {
+    httpOnly: true, // not accessible via JS
+    secure: process.env.NODE_ENV === "production", // HTTPS only in prod
+    sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in ms
+    path: "/api/auth", // only sent to auth routes
   });
 };
 
@@ -101,11 +98,11 @@ const setRefreshTokenCookie = (res, token) => {
  * Clear refresh token cookie (on logout)
  */
 const clearRefreshTokenCookie = (res) => {
-  res.clearCookie('refreshToken', {
+  res.clearCookie("refreshToken", {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'strict' : 'lax',
-    path: '/api/auth',
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
+    path: "/api/auth",
   });
 };
 
