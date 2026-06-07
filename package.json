@@ -1,0 +1,9 @@
+{
+  "name": "ai-powered-recommendation-system-v2",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "echo \"Start script not configured yet\"",
+    "dev": "echo \"Dev script not configured yet\""
+  }
+}
