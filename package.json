@@ -1,9 +1,15 @@
 {
-  "name": "ai-powered-recommendation-system-v2",
-  "version": "0.1.0",
+  "name": "ai-recommendation-system",
+  "version": "2.0.0",
   "private": true,
+  "workspaces": ["backend", "frontend"],
   "scripts": {
-    "start": "echo \"Start script not configured yet\"",
-    "dev": "echo \"Dev script not configured yet\""
+    "dev": "concurrently \"npm run dev --workspace=backend\" \"npm run dev --workspace=frontend\"",
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "build": "npm run build --workspace=frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
   }
 }
