@@ -6,6 +6,8 @@ const Purchase = require('../models/Purchase');
 const Product = require('../models/Product');
 const { protect, restrictTo } = require('../middleware/auth');
 const validate = require('../middleware/validate');
+const { invalidateUserRecommendations } = require('../services/recommendationService');
+
 
 // All purchase routes require auth
 router.use(protect);
@@ -41,6 +43,8 @@ router.post('/', purchaseValidation, validate, async (req, res) => {
 
     // Decrement stock
     await Product.findByIdAndUpdate(productId, { $inc: { stock: -quantity } });
+    // Invalidate recommendation cache — new purchase changes preferences
+    await invalidateUserRecommendations(req.user.userId);
 
     await purchase.populate('productId', 'name brand category image');
 

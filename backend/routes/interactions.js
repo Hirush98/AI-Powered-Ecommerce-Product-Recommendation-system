@@ -6,6 +6,8 @@ const UserInteraction = require('../models/UserInteraction');
 const Product = require('../models/Product');
 const { protect } = require('../middleware/auth');
 const validate = require('../middleware/validate');
+const { invalidateUserRecommendations } = require('../services/recommendationService');
+
 
 router.use(protect);
 
@@ -46,7 +48,13 @@ router.post('/', interactionValidation, validate, async (req, res) => {
       metadata: metadata || {},
     });
 
+    // Invalidate cache on meaningful interactions
+    if (['like', 'add_to_cart', 'purchase'].includes(interactionType)) {
+    await invalidateUserRecommendations(req.user.userId);
+}
+
     return res.status(201).json({ success: true, data: interaction });
+
   } catch (error) {
     console.error('Interaction error:', error);
     return res.status(500).json({ success: false, message: 'Server error.' });

@@ -13,6 +13,9 @@ const PORT = process.env.PORT || 5000;
 
 // ─── Connect Database ─────────────────────────────────────────────────────────
 connectDB();
+const { connectRedis } = require('./config/redis');
+connectRedis();
+
 
 // ─── Security Middleware ──────────────────────────────────────────────────────
 app.use(helmet());

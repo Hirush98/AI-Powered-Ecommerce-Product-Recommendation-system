@@ -1,375 +1,272 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const { Product, Customer, Purchase, UserInteraction } = require('../models/schemas');
+const Purchase        = require('../models/Purchase');
+const UserInteraction = require('../models/UserInteraction');
+const Product         = require('../models/Product');
+const { cacheGet, cacheSet, cacheDel, CacheKeys, TTL } = require('../utils/cache');
 
-class RecommendationService {
-  constructor(apiKey) {
-    this.genAI = new GoogleGenerativeAI(apiKey);
-    this.model = this.genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+// ─── Gemini client ────────────────────────────────────────────────────────────
+let genAI  = null;
+let model  = null;
+
+const getModel = () => {
+  if (!model) {
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY is not set in environment variables.');
+    }
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+  }
+  return model;
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Build a compact user context object from DB.
+ * Solves V1's N+1 problem — single aggregation per data type.
+ */
+const buildUserContext = async (userId) => {
+  // Run all DB queries in parallel
+  const [purchases, interactions] = await Promise.all([
+    Purchase.find({ userId })
+      .populate('productId', 'name category brand price tags')
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean(),
+
+    UserInteraction.find({ userId })
+      .populate('productId', 'name category brand tags')
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean(),
+  ]);
+
+  // Aggregate category preferences from interactions + purchases
+  const categoryScore = {};
+
+  purchases.forEach(({ productId: p, quantity = 1 }) => {
+    if (!p?.category) return;
+    categoryScore[p.category] = (categoryScore[p.category] || 0) + quantity * 3; // purchases weight 3x
+  });
+
+  interactions.forEach(({ productId: p, interactionType }) => {
+    if (!p?.category) return;
+    const weight = interactionType === 'like'
+      ? 2
+      : interactionType === 'add_to_cart'
+      ? 2
+      : interactionType === 'view'
+      ? 1
+      : 0;
+    categoryScore[p.category] = (categoryScore[p.category] || 0) + weight;
+  });
+
+  // Top 5 categories by score
+  const topCategories = Object.entries(categoryScore)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([cat]) => cat);
+
+  // Recently interacted product IDs (to exclude from recommendations)
+  const recentProductIds = new Set([
+    ...purchases.map((p) => p.productId?._id?.toString()).filter(Boolean),
+    ...interactions.map((i) => i.productId?._id?.toString()).filter(Boolean),
+  ]);
+
+  // Liked / carted products
+  const likedProducts = interactions
+    .filter((i) => ['like', 'add_to_cart'].includes(i.interactionType) && i.productId)
+    .map((i) => ({ name: i.productId.name, category: i.productId.category }))
+    .slice(0, 10);
+
+  // Purchase summary
+  const purchaseSummary = purchases
+    .filter((p) => p.productId)
+    .map((p) => ({ name: p.productId.name, category: p.productId.category, brand: p.productId.brand }))
+    .slice(0, 10);
+
+  return { topCategories, recentProductIds, likedProducts, purchaseSummary };
+};
+
+/**
+ * Fetch candidate products smartly — only from user's top categories.
+ * Fixes V1's approach of sending all 50 products to Gemini.
+ */
+const fetchCandidateProducts = async (topCategories, recentProductIds, limit = 30) => {
+  const filter = { isActive: true };
+
+  // Prioritise top categories if we have them
+  if (topCategories.length > 0) {
+    filter.category = { $in: topCategories };
   }
 
-  // Get user's purchase history and interests
-  async getUserProfile(customerId) {
-    try {
-      const customer = await Customer.findById(customerId);
-      if (!customer) {
-        throw new Error('Customer not found');
-      }
+  // Exclude recently seen products
+  if (recentProductIds.size > 0) {
+    filter._id = { $nin: [...recentProductIds] };
+  }
 
-      // Get purchase history
-      const purchases = await Purchase.find({ customerId })
-        .populate('productId')
-        .sort({ purchaseDate: -1 })
-        .limit(20);
+  let products = await Product.find(filter)
+    .sort({ rating: -1 })
+    .limit(limit)
+    .lean();
 
-      // Get recent interactions (views, likes, cart additions)
-      const interactions = await UserInteraction.find({ customerId })
-        .populate('productId')
-        .sort({ timestamp: -1 })
-        .limit(50);
+  // If not enough results, backfill with top-rated products from any category
+  if (products.length < 10) {
+    const backfillFilter = {
+      isActive: true,
+      _id: { $nin: [...recentProductIds, ...products.map((p) => p._id)] },
+    };
 
-      // Analyze purchase patterns
-      const purchasedCategories = {};
-      const purchasedBrands = {};
-      const priceRange = { min: Infinity, max: 0 };
-      
-      purchases.forEach(purchase => {
-        const product = purchase.productId;
-        purchasedCategories[product.category] = (purchasedCategories[product.category] || 0) + 1;
-        purchasedBrands[product.brand] = (purchasedBrands[product.brand] || 0) + 1;
-        priceRange.min = Math.min(priceRange.min, product.price);
-        priceRange.max = Math.max(priceRange.max, product.price);
-      });
+    const backfill = await Product.find(backfillFilter)
+      .sort({ rating: -1 })
+      .limit(limit - products.length)
+      .lean();
 
-      // Analyze interaction patterns
-      const viewedCategories = {};
-      const viewedBrands = {};
-      
-      interactions.forEach(interaction => {
-        const product = interaction.productId;
-        if (product) {
-          viewedCategories[product.category] = (viewedCategories[product.category] || 0) + 1;
-          viewedBrands[product.brand] = (viewedBrands[product.brand] || 0) + 1;
-        }
-      });
+    products = [...products, ...backfill];
+  }
 
-      return {
-        customer,
-        purchases,
-        interactions,
-        purchasedCategories,
-        purchasedBrands,
-        viewedCategories,
-        viewedBrands,
-        priceRange: priceRange.min === Infinity ? { min: 0, max: 1000 } : priceRange
-      };
-    } catch (error) {
-      console.error('Error getting user profile:', error);
-      throw error;
+  return products;
+};
+
+/**
+ * Build a lean prompt — only essential fields sent to Gemini.
+ * Fixes V1's raw JSON dump of full product objects.
+ */
+const buildPrompt = (userContext, products, userProfile) => {
+  const productList = products.map((p) => ({
+    id:       p._id.toString(),
+    name:     p.name,
+    category: p.category,
+    brand:    p.brand,
+    price:    p.price,
+    rating:   p.rating,
+    tags:     p.tags?.slice(0, 5) || [],
+  }));
+
+  return `
+You are an expert e-commerce recommendation engine.
+
+USER PROFILE:
+- Name: ${userProfile.firstName} ${userProfile.lastName}
+- Age: ${userProfile.age || 'unknown'}
+- Location: ${userProfile.location || 'unknown'}
+- Interests: ${userProfile.interests?.join(', ') || 'none listed'}
+
+SHOPPING BEHAVIOUR:
+- Top categories: ${userContext.topCategories.join(', ') || 'none yet'}
+- Recent purchases: ${JSON.stringify(userContext.purchaseSummary)}
+- Liked / carted: ${JSON.stringify(userContext.likedProducts)}
+
+AVAILABLE PRODUCTS (candidates only):
+${JSON.stringify(productList)}
+
+TASK:
+Select exactly 6 products from the list above that this user would most likely enjoy.
+For each, write a short 1-sentence personalised reason.
+
+RESPOND WITH VALID JSON ONLY — no markdown, no explanation, no extra text:
+{
+  "recommendations": [
+    {
+      "productId": "<id from the list>",
+      "reason": "<personalised reason>"
+    }
+  ]
+}
+`.trim();
+};
+
+// ─── Main exported function ───────────────────────────────────────────────────
+
+/**
+ * Get AI-powered recommendations for a user.
+ * Checks Redis cache first — only calls Gemini on cache miss.
+ *
+ * @param {Object} userProfile  — User mongoose document
+ * @param {boolean} forceRefresh — Skip cache and re-generate
+ */
+const getRecommendations = async (userProfile, forceRefresh = false) => {
+  const userId   = userProfile._id.toString();
+  const cacheKey = CacheKeys.recommendations(userId);
+
+  // ── 1. Cache check ──────────────────────────────────────────────────────────
+  if (!forceRefresh) {
+    const cached = await cacheGet(cacheKey);
+    if (cached) {
+      const parsed = typeof cached === 'string' ? JSON.parse(cached) : cached;
+      return { ...parsed, cached: true };
     }
   }
 
-  // Get product recommendations using Gemini AI
-  async getRecommendations(customerId, limit = 10) {
-    try {
-      const userProfile = await this.getUserProfile(customerId);
-      
-      // Get all available products (excluding already purchased ones)
-      const purchasedProductIds = userProfile.purchases.map(p => p.productId._id.toString());
-      const availableProducts = await Product.find({
-        _id: { $nin: purchasedProductIds },
-        stock: { $gt: 0 }
-      });
+  // ── 2. Build user context (parallel DB queries) ──────────────────────────
+  const userContext = await buildUserContext(userId);
 
-      // Prepare data for AI analysis
-      const userContext = {
-        customerInfo: {
-          age: userProfile.customer.age,
-          gender: userProfile.customer.gender,
-          location: userProfile.customer.location,
-          interests: userProfile.customer.interests
-        },
-        purchaseHistory: userProfile.purchases.map(p => ({
-          productName: p.productId.name,
-          category: p.productId.category,
-          brand: p.productId.brand,
-          price: p.price,
-          rating: p.rating,
-          purchaseDate: p.purchaseDate
-        })),
-        browsingBehavior: {
-          topViewedCategories: Object.entries(userProfile.viewedCategories)
-            .sort(([,a], [,b]) => b - a)
-            .slice(0, 5),
-          topViewedBrands: Object.entries(userProfile.viewedBrands)
-            .sort(([,a], [,b]) => b - a)
-            .slice(0, 5)
-        },
-        pricePreference: userProfile.priceRange
-      };
+  // ── 3. Fetch smart candidate products ────────────────────────────────────
+  const candidates = await fetchCandidateProducts(
+    userContext.topCategories,
+    userContext.recentProductIds
+  );
 
-      // Create AI prompt
-      const prompt = `
-        You are an AI recommendation system for an e-commerce platform. Analyze the following user profile and recommend the most suitable products from the available inventory.
-
-        User Profile:
-        ${JSON.stringify(userContext, null, 2)}
-
-        Available Products (first 50 for context):
-        ${JSON.stringify(availableProducts.slice(0, 50).map(p => ({
-          id: p._id,
-          name: p.name,
-          category: p.category,
-          brand: p.brand,
-          price: p.price,
-          rating: p.rating,
-          tags: p.tags,
-          features: p.features
-        })), null, 2)}
-
-        Please analyze this user's preferences and behavior patterns, then provide recommendations. Consider:
-        1. Category preferences (both purchased and browsed)
-        2. Brand loyalty patterns
-        3. Price range preferences
-        4. Age and demographic factors
-        5. Product ratings and reviews
-        6. Seasonal/trending factors
-
-        Respond with a JSON array of recommended product IDs in order of relevance (most relevant first). 
-        Include exactly ${limit} recommendations and provide a brief explanation for each recommendation.
-
-        Format your response as:
-        {
-          "recommendations": [
-            {
-              "productId": "product_id_here",
-              "reason": "Brief explanation why this product is recommended",
-              "relevanceScore": 0.95
-            }
-          ]
-        }
-      `;
-
-      // Get AI recommendations
-      const result = await this.model.generateContent(prompt);
-      const response = await result.response;
-      const text = response.text();
-      
-      // Parse AI response
-      let aiRecommendations;
-      try {
-        // Extract JSON from response
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          aiRecommendations = JSON.parse(jsonMatch[0]);
-        } else {
-          throw new Error('No JSON found in AI response');
-        }
-      } catch (parseError) {
-        console.error('Error parsing AI response:', parseError);
-        // Fallback to rule-based recommendations
-        return this.getFallbackRecommendations(userProfile, availableProducts, limit);
-      }
-
-      // Get full product details for recommended products
-      const recommendedProductIds = aiRecommendations.recommendations.map(r => r.productId);
-      const recommendedProducts = await Product.find({
-        _id: { $in: recommendedProductIds }
-      });
-
-      // Match products with AI reasoning
-      const finalRecommendations = aiRecommendations.recommendations.map(aiRec => {
-        const product = recommendedProducts.find(p => p._id.toString() === aiRec.productId);
-        return {
-          product,
-          reason: aiRec.reason,
-          relevanceScore: aiRec.relevanceScore || 0.5,
-          aiGenerated: true
-        };
-      }).filter(rec => rec.product); // Remove any products not found
-
-      return {
-        recommendations: finalRecommendations,
-        userProfile: {
-          customerInfo: userProfile.customer,
-          totalPurchases: userProfile.purchases.length,
-          favoriteCategories: Object.keys(userProfile.purchasedCategories),
-          priceRange: userProfile.priceRange
-        }
-      };
-
-    } catch (error) {
-      console.error('Error getting AI recommendations:', error);
-      
-      // Fallback to rule-based recommendations
-      const userProfile = await this.getUserProfile(customerId);
-      const purchasedProductIds = userProfile.purchases.map(p => p.productId._id.toString());
-      const availableProducts = await Product.find({
-        _id: { $nin: purchasedProductIds },
-        stock: { $gt: 0 }
-      });
-      
-      return this.getFallbackRecommendations(userProfile, availableProducts, limit);
-    }
-  }
-
-  // Fallback rule-based recommendations
-  getFallbackRecommendations(userProfile, availableProducts, limit = 10) {
-    const recommendations = [];
-    
-    // Rule 1: Recommend products from favorite categories
-    const favoriteCategories = Object.keys(userProfile.purchasedCategories)
-      .concat(userProfile.customer.interests)
-      .concat(Object.keys(userProfile.viewedCategories));
-    
-    const categoryProducts = availableProducts.filter(p => 
-      favoriteCategories.includes(p.category)
-    ).sort((a, b) => b.rating - a.rating);
-    
-    // Rule 2: Consider price range
-    const priceFilteredProducts = categoryProducts.filter(p => 
-      p.price >= userProfile.priceRange.min * 0.5 && 
-      p.price <= userProfile.priceRange.max * 2
-    );
-    
-    // Rule 3: High-rated products
-    const finalProducts = priceFilteredProducts.length > 0 ? priceFilteredProducts : 
-      availableProducts.sort((a, b) => b.rating - a.rating);
-    
-    // Select top products
-    const selectedProducts = finalProducts.slice(0, limit);
-    
-    selectedProducts.forEach((product, index) => {
-      recommendations.push({
-        product,
-        reason: `Recommended based on your interest in ${product.category} and high rating (${product.rating}/5)`,
-        relevanceScore: Math.max(0.1, 1 - (index * 0.1)),
-        aiGenerated: false
-      });
-    });
+  if (candidates.length === 0) {
+    // New user — return top rated products as fallback
+    const fallback = await Product.find({ isActive: true })
+      .sort({ rating: -1 })
+      .limit(6)
+      .lean();
 
     return {
-      recommendations,
-      userProfile: {
-        customerInfo: userProfile.customer,
-        totalPurchases: userProfile.purchases.length,
-        favoriteCategories: Object.keys(userProfile.purchasedCategories),
-        priceRange: userProfile.priceRange
-      }
+      recommendations: fallback.map((p) => ({
+        product: p,
+        reason: 'Highly rated product — explore what others love.',
+      })),
+      cached: false,
+      fallback: true,
     };
   }
 
-  // Get trending products for homepage
-  async getTrendingProducts(limit = 20) {
-    try {
-      // Get products with high ratings and recent purchases
-      const trendingProducts = await Product.aggregate([
-        {
-          $lookup: {
-            from: 'purchases',
-            localField: '_id',
-            foreignField: 'productId',
-            as: 'recentPurchases'
-          }
-        },
-        {
-          $addFields: {
-            recentPurchaseCount: {
-              $size: {
-                $filter: {
-                  input: '$recentPurchases',
-                  cond: {
-                    $gte: ['$$this.purchaseDate', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)]
-                  }
-                }
-              }
-            },
-            trendingScore: {
-              $add: [
-                { $multiply: ['$rating', 0.4] },
-                { $multiply: ['$reviews', 0.0001] },
-                { $multiply: [{ $size: '$recentPurchases' }, 0.3] }
-              ]
-            }
-          }
-        },
-        {
-          $match: { stock: { $gt: 0 } }
-        },
-        {
-          $sort: { trendingScore: -1 }
-        },
-        {
-          $limit: limit
-        }
-      ]);
+  // ── 4. Call Gemini ────────────────────────────────────────────────────────
+  const prompt = buildPrompt(userContext, candidates, userProfile);
+  const aiModel = getModel();
 
-      return trendingProducts;
-    } catch (error) {
-      console.error('Error getting trending products:', error);
-      // Fallback to highest rated products
-      return await Product.find({ stock: { $gt: 0 } })
-        .sort({ rating: -1, reviews: -1 })
-        .limit(limit);
-    }
+  let parsedAI;
+  try {
+    const result   = await aiModel.generateContent(prompt);
+    const rawText  = result.response.text().trim();
+
+    // Strip markdown code fences if Gemini wraps in ```json
+    const clean = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    parsedAI = JSON.parse(clean);
+  } catch (error) {
+    console.error('Gemini response parse error:', error.message);
+    throw new Error('AI service returned an unexpected response. Please try again.');
   }
 
-  // Get personalized homepage recommendations
-  async getHomepageRecommendations(customerId = null) {
-    try {
-      const result = {
-        trending: await this.getTrendingProducts(10),
-        categories: await this.getCategoryHighlights(),
-        newArrivals: await this.getNewArrivals(8)
-      };
+  // ── 5. Hydrate product data from DB (trust our DB, not AI output) ─────────
+  const productMap = new Map(candidates.map((p) => [p._id.toString(), p]));
 
-      if (customerId) {
-        const personalizedRecs = await this.getRecommendations(customerId, 8);
-        result.personalizedForYou = personalizedRecs.recommendations;
-        result.userProfile = personalizedRecs.userProfile;
-      }
+  const recommendations = parsedAI.recommendations
+    .filter((r) => productMap.has(r.productId))  // discard hallucinated IDs
+    .map((r) => ({
+      product: productMap.get(r.productId),
+      reason:  r.reason,
+    }))
+    .slice(0, 6);
 
-      return result;
-    } catch (error) {
-      console.error('Error getting homepage recommendations:', error);
-      throw error;
-    }
-  }
+  const result = { recommendations, cached: false, fallback: false };
 
-  // Get category highlights
-  async getCategoryHighlights() {
-    try {
-      const categories = await Product.distinct('category');
-      const highlights = {};
+  // ── 6. Cache the result ───────────────────────────────────────────────────
+  await cacheSet(cacheKey, result, TTL.RECOMMENDATIONS);
 
-      for (const category of categories) {
-        const topProduct = await Product.findOne({ 
-          category, 
-          stock: { $gt: 0 } 
-        }).sort({ rating: -1, reviews: -1 });
-        
-        if (topProduct) {
-          highlights[category] = topProduct;
-        }
-      }
+  return result;
+};
 
-      return highlights;
-    } catch (error) {
-      console.error('Error getting category highlights:', error);
-      return {};
-    }
-  }
+/**
+ * Invalidate a user's recommendation cache.
+ * Call this after a new purchase or significant interaction.
+ */
+const invalidateUserRecommendations = async (userId) => {
+  await cacheDel(CacheKeys.recommendations(userId.toString()));
+};
 
-  // Get new arrivals
-  async getNewArrivals(limit = 10) {
-    try {
-      return await Product.find({ stock: { $gt: 0 } })
-        .sort({ createdAt: -1 })
-        .limit(limit);
-    } catch (error) {
-      console.error('Error getting new arrivals:', error);
-      return [];
-    }
-  }
-}
+module.exports = { getRecommendations, invalidateUserRecommendations };
 
-module.exports = RecommendationService;
