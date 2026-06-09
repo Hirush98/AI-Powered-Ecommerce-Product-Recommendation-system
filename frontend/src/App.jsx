@@ -5,25 +5,26 @@ import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 
 import useAuthStore from '@/store/authStore';
 import ProtectedRoute from '@/components/ui/ProtectedRoute';
+import Layout from '@/components/layout/Layout';
 import LoadingSpinner from '@/components/ui/LoadingSpinner';
 
-// Pages — imported here, built in Chunk 8
-import LoginPage        from '@/pages/LoginPage';
-import RegisterPage     from '@/pages/RegisterPage';
-import HomePage         from '@/pages/HomePage';
-import ProductsPage     from '@/pages/ProductsPage';
-import ProductDetailPage from '@/pages/ProductDetailPage';
-import RecommendationsPage from '@/pages/RecommendationsPage';
-import PurchasesPage    from '@/pages/PurchasesPage';
-import ProfilePage      from '@/pages/ProfilePage';
-import AnalyticsPage    from '@/pages/AnalyticsPage';
-import NotFoundPage     from '@/pages/NotFoundPage';
+// Pages
+import LoginPage            from '@/pages/LoginPage';
+import RegisterPage         from '@/pages/RegisterPage';
+import HomePage             from '@/pages/HomePage';
+import ProductsPage         from '@/pages/ProductsPage';
+import ProductDetailPage    from '@/pages/ProductDetailPage';
+import RecommendationsPage  from '@/pages/RecommendationsPage';
+import PurchasesPage        from '@/pages/PurchasesPage';
+import ProfilePage          from '@/pages/ProfilePage';
+import AnalyticsPage        from '@/pages/AnalyticsPage';
+import NotFoundPage         from '@/pages/NotFoundPage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 1,
-      staleTime: 1000 * 60 * 5,     // 5 minutes
+      staleTime: 1000 * 60 * 5,
       refetchOnWindowFocus: false,
     },
   },
@@ -32,49 +33,47 @@ const queryClient = new QueryClient({
 export default function App() {
   const { initAuth, isLoading } = useAuthStore();
 
-  // Restore session on app boot
   useEffect(() => {
     initAuth();
   }, []);
 
-  // Listen for forced logout events (from axios interceptor)
   useEffect(() => {
-    const handleForceLogout = () => {
-      useAuthStore.getState().logout();
-    };
+    const handleForceLogout = () => useAuthStore.getState().logout();
     window.addEventListener('auth:logout', handleForceLogout);
     return () => window.removeEventListener('auth:logout', handleForceLogout);
   }, []);
 
-  if (isLoading) {
-    return <LoadingSpinner fullPage />;
-  }
+  if (isLoading) return <LoadingSpinner fullPage />;
 
   return (
     <QueryClientProvider client={queryClient}>
       <Routes>
-        {/* Public routes */}
+        {/* Public — no layout */}
         <Route path="/login"    element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
 
-        {/* Protected — any authenticated user */}
+        {/* Protected — with navbar/footer layout */}
         <Route element={<ProtectedRoute />}>
-          <Route path="/"                element={<HomePage />} />
-          <Route path="/products"        element={<ProductsPage />} />
-          <Route path="/products/:id"    element={<ProductDetailPage />} />
-          <Route path="/recommendations" element={<RecommendationsPage />} />
-          <Route path="/purchases"       element={<PurchasesPage />} />
-          <Route path="/profile"         element={<ProfilePage />} />
+          <Route element={<Layout />}>
+            <Route path="/"                  element={<HomePage />} />
+            <Route path="/products"          element={<ProductsPage />} />
+            <Route path="/products/:id"      element={<ProductDetailPage />} />
+            <Route path="/recommendations"   element={<RecommendationsPage />} />
+            <Route path="/purchases"         element={<PurchasesPage />} />
+            <Route path="/profile"           element={<ProfilePage />} />
+          </Route>
         </Route>
 
-        {/* Protected — admin only */}
+        {/* Admin only — with layout */}
         <Route element={<ProtectedRoute requiredRole="admin" />}>
-          <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route element={<Layout />}>
+            <Route path="/analytics" element={<AnalyticsPage />} />
+          </Route>
         </Route>
 
         {/* Fallback */}
-        <Route path="/404"  element={<NotFoundPage />} />
-        <Route path="*"     element={<Navigate to="/404" replace />} />
+        <Route path="/404" element={<NotFoundPage />} />
+        <Route path="*"    element={<Navigate to="/404" replace />} />
       </Routes>
 
       {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}
