@@ -1,9 +1,6 @@
 node_modules/
 **/node_modules/
 
-.env
-.env.local
-**/.env
 **/.env.local
 
 dist/
@@ -16,8 +13,8 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-.vscode/
 .idea/
 
 coverage/
 .vercel/
+config.bat
